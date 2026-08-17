@@ -50,16 +50,52 @@ async function resolveVideos(profileUrl, cookiesFile, initialVideos = []) {
   }
 }
 
+function findNestedKey(value, key) {
+  if (!value || typeof value !== 'object') return null;
+  if (Object.prototype.hasOwnProperty.call(value, key)) return value[key];
+  if (Array.isArray(value)) for (const item of value) { const found = findNestedKey(item, key); if (found) return found; }
+  else for (const item of Object.values(value)) { const found = findNestedKey(item, key); if (found) return found; }
+  return null;
+}
+
+async function fetchTikTokEmbedMediaUrl(videoId) {
+  const embedUrl = `https://www.tiktok.com/embed/v2/${videoId}`;
+  const res = await axios.get(embedUrl, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36', Accept: 'text/html,application/xhtml+xml' },
+    timeout: 45000,
+    validateStatus: () => true
+  });
+  if (res.status < 200 || res.status >= 300) throw new Error(`TikTok embed HTTP ${res.status}`);
+  const $ = cheerio.load(String(res.data || ''));
+  const raw = $('#__FRONTITY_CONNECT_STATE__').html();
+  if (!raw) throw new Error('TikTok embed state tidak ditemukan');
+  const state = JSON.parse(raw);
+  const videoData = findNestedKey(state, 'videoData');
+  const mediaUrl = videoData?.itemInfos?.video?.urls?.[0];
+  if (!mediaUrl || !/^https:\/\/[^/]*tiktokcdn\.com\//i.test(mediaUrl)) throw new Error('Signed TikTok CDN URL tidak ditemukan');
+  return mediaUrl;
+}
+
 async function downloadTikTokVideo(videoUrl, outputDir = path.join(os.tmpdir(), 'ttstalk'), cookiesFile) {
   if (!/^https:\/\/www\.tiktok\.com\/@[^/]+\/video\/\d+/.test(videoUrl)) throw new Error('URL TikTok tidak valid');
+  const id = (videoUrl.match(/\/video\/(\d+)/) || [])[1];
   fs.mkdirSync(outputDir, { recursive: true });
-  const output = path.join(outputDir, '%(id)s.%(ext)s');
-  const args = ['--no-playlist', '--format', 'mp4/best[ext=mp4]/best', '--merge-output-format', 'mp4', '--output', output, '--no-warnings'];
+  const output = path.join(outputDir, `${id}.%(ext)s`);
+  const baseArgs = ['--no-playlist', '--format', 'mp4/best[ext=mp4]/best', '--merge-output-format', 'mp4', '--output', output, '--no-warnings', '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'];
+  const args = [...baseArgs];
   if (cookiesFile && fs.existsSync(cookiesFile)) args.push('--cookies', cookiesFile);
   args.push(videoUrl);
-  await runYtDlp(args, 180000);
-  const id = (videoUrl.match(/\/video\/(\d+)/) || [])[1];
-  const found = fs.readdirSync(outputDir).filter(name => name.startsWith(`${id}.`)).sort();
+  try {
+    await runYtDlp(args, 180000);
+    ttLog('YTDLP_DIRECT_OK', { id });
+  } catch (directError) {
+    ttLog('YTDLP_DIRECT_ERROR', { id, message: directError.message });
+    const signedUrl = await fetchTikTokEmbedMediaUrl(id);
+    ttLog('EMBED_SIGNED_URL_OK', { id, host: new URL(signedUrl).hostname });
+    await runYtDlp([...baseArgs, signedUrl], 180000);
+    ttLog('YTDLP_EMBED_OK', { id });
+  }
+  const found = fs.readdirSync(outputDir).filter(name => name.startsWith(`${id}.`) && !name.endsWith('.part')).sort();
   if (!found.length) throw new Error(`yt-dlp selesai tetapi file video ${id} tidak ditemukan`);
   return path.join(outputDir, found[0]);
 }

@@ -127,25 +127,27 @@ case 'stalktt': {
     await ai.send(m.chat, { forwarded: true, mentions: [m.sender] });
     log('SEND_OK', { mediaMode, sentVideos: validVideos.length });
 
-    // URL sudah berhasil diperoleh; yt-dlp dipakai untuk mengunduh dan mengirim media satu per satu.
+    // Validasi download dengan yt-dlp ke tmp, lalu hapus file. Tidak ada video yang dikirim.
+    const cookiesFile = path.join(process.cwd(), 'cookies', 'cookiestt.txt');
     for (const [index, video] of validVideos.entries()) {
-      const downloadDir = path.join(require('os').tmpdir(), 'ttstalk', String(Date.now()));
+      const downloadDir = path.join(require('os').tmpdir(), 'ttstalk', `${Date.now()}-${index + 1}`);
       try {
-        log('DOWNLOAD_START', { index: index + 1, total: validVideos.length, url: video.url });
-        const filePath = await downloadTikTokVideo(video.url, downloadDir, path.join(process.cwd(), 'cookies', 'cookiestt.txt'));
-        log('DOWNLOAD_OK', { index: index + 1, url: video.url, filePath });
-        await alip.sendMessage(m.chat, {
-          video: { url: filePath },
-          caption: `${index + 1}. ${video.caption || video.title || 'Video TikTok'}\n${video.url}`,
-          mimetype: 'video/mp4',
-          mentions: [m.sender]
-        }, { quoted: m });
-        log('VIDEO_SEND_OK', { index: index + 1, url: video.url });
-        try { require('fs').rmSync(downloadDir, { recursive: true, force: true }); } catch {}
+        log('DOWNLOAD_START', { index: index + 1, total: validVideos.length, url: video.url, sendVideo: false });
+        const filePath = await downloadTikTokVideo(video.url, downloadDir, cookiesFile);
+        const stat = require('fs').statSync(filePath);
+        log('DOWNLOAD_OK', { index: index + 1, url: video.url, bytes: stat.size, sendVideo: false });
       } catch (downloadError) {
         log('DOWNLOAD_ERROR', { index: index + 1, url: video.url, message: downloadError.message, stack: downloadError.stack });
+      } finally {
+        try {
+          require('fs').rmSync(downloadDir, { recursive: true, force: true });
+          log('DOWNLOAD_CLEANUP', { index: index + 1, url: video.url, directory: downloadDir, deleted: true });
+        } catch (cleanupError) {
+          log('DOWNLOAD_CLEANUP_ERROR', { index: index + 1, url: video.url, message: cleanupError.message });
+        }
       }
     }
+    log('LINKS_ONLY', { sentVideos: validVideos.length, downloadedToTmp: validVideos.length > 0, sentVideoFiles: false });
     await alip.sendMessage(m.chat, { react: { text: '✅', key: m.key } });
   } catch (err) {
     log('ERROR', { message: err.message, stack: err.stack });

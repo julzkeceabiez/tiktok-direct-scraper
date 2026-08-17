@@ -42,3 +42,9 @@ sudo apt-get install -y ffmpeg
 Scraper akan mencoba membaca video dari response TikTok terlebih dahulu. Jika `itemList` kosong, scraper menggunakan `yt-dlp --flat-playlist --playlist-end 5` pada URL profil, sehingga response tetap berupa URL halaman video, bukan file video. Handler `ttstalk` pada `ttstalk-handler-stable.js` kemudian mengirim kartu profil, mengunduh setiap URL dengan `yt-dlp`, dan mengirim maksimal lima file video secara berurutan.
 
 Log per video menggunakan tahap `YTDLP_RESULT`, `DOWNLOAD_START`, `DOWNLOAD_OK`, `VIDEO_SEND_OK`, atau `DOWNLOAD_ERROR`. Cookie tidak pernah dicetak ke log.
+
+## Validasi download sementara tanpa mengirim video
+
+Handler `ttstalk-handler-stable.js` tetap menjalankan `downloadTikTokVideo()` untuk memastikan setiap URL benar-benar dapat diunduh, tetapi file ditulis ke folder temporary dan dihapus dalam blok `finally`. Tidak ada file video yang dikirim ke WhatsApp.
+
+Jika halaman video TikTok langsung terkena challenge yt-dlp, helper mengambil signed media URL dari halaman resmi `https://www.tiktok.com/embed/v2/<video_id>`, menjalankan yt-dlp terhadap URL CDN tersebut, lalu menghapus hasilnya setelah validasi. Log membedakan `YTDLP_DIRECT_ERROR`, `EMBED_SIGNED_URL_OK`, `YTDLP_EMBED_OK`, `DOWNLOAD_OK`, `DOWNLOAD_ERROR`, dan `DOWNLOAD_CLEANUP`.
