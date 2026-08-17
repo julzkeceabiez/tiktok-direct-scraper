@@ -9,15 +9,91 @@ const { execFile } = require('child_process');
 const { promisify } = require('util');
 const execFileAsync = promisify(execFile);
 
+const BIN_DIR = path.join(process.cwd(), 'bin');
+const LOCAL_YTDLP = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+let ytDlpInstallPromise = null;
+let ytDlpResolved = null;
+
+function logInstall(stage, payload = {}) {
+  try { console.log(`[YT-DLP][${stage}] ${JSON.stringify(payload)}`); } catch { console.log(`[YT-DLP][${stage}]`); }
+}
+
+async function executableWorks(binary) {
+  try {
+    const result = await execFileAsync(binary, ['--version'], { timeout: 30000, maxBuffer: 1024 * 1024 });
+    return Boolean(String(result.stdout || '').trim());
+  } catch { return false; }
+}
+
+async function installYtDlpViaPip() {
+  const commands = process.platform === 'win32'
+    ? [['py', ['-m', 'pip', 'install', '--user', '-U', 'yt-dlp']], ['python', ['-m', 'pip', 'install', '--user', '-U', 'yt-dlp']]]
+    : [['python3', ['-m', 'pip', 'install', '--user', '-U', 'yt-dlp']], ['python3', ['-m', 'pip', 'install', '-U', 'yt-dlp']], ['pip3', ['install', '--user', '-U', 'yt-dlp']]];
+  for (const [command, args] of commands) {
+    try {
+      logInstall('PIP_START', { command });
+      await execFileAsync(command, args, { timeout: 180000, maxBuffer: 4 * 1024 * 1024 });
+      const candidates = process.platform === 'win32' ? ['yt-dlp.exe', 'yt-dlp'] : ['yt-dlp', path.join(process.env.HOME || '', '.local', 'bin', 'yt-dlp')];
+      for (const candidate of candidates) if (await executableWorks(candidate)) return candidate;
+    } catch (error) {
+      logInstall('PIP_ERROR', { command, message: error.message.split('\\n')[0] });
+    }
+  }
+  return null;
+}
+
+async function installYtDlpBinary() {
+  if (process.platform === 'win32') return null;
+  const arch = process.arch === 'arm64' ? 'aarch64' : process.arch === 'arm' ? 'armv7l' : 'x86_64';
+  const platformName = process.platform === 'darwin' ? 'macos' : 'linux';
+  const downloadUrl = `https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_${platformName}${platformName === 'linux' && arch === 'aarch64' ? '_aarch64' : ''}`;
+  try {
+    await fs.promises.mkdir(BIN_DIR, { recursive: true });
+    logInstall('BINARY_START', { platform: platformName, arch, url: downloadUrl });
+    const response = await axios.get(downloadUrl, { responseType: 'arraybuffer', timeout: 120000, maxContentLength: 50 * 1024 * 1024 });
+    await fs.promises.writeFile(LOCAL_YTDLP, Buffer.from(response.data));
+    await fs.promises.chmod(LOCAL_YTDLP, 0o755);
+    if (await executableWorks(LOCAL_YTDLP)) return LOCAL_YTDLP;
+  } catch (error) {
+    logInstall('BINARY_ERROR', { message: error.message.split('\\n')[0] });
+  }
+  return null;
+}
+
+async function ensureYtDlp() {
+  if (ytDlpResolved && await executableWorks(ytDlpResolved)) return ytDlpResolved;
+  if (ytDlpInstallPromise) return ytDlpInstallPromise;
+  ytDlpInstallPromise = (async () => {
+    const candidates = [LOCAL_YTDLP, process.env.YTDLP_PATH, 'yt-dlp'];
+    for (const candidate of candidates.filter(Boolean)) {
+      if (await executableWorks(candidate)) {
+        ytDlpResolved = candidate;
+        logInstall('READY', { binary: candidate });
+        return candidate;
+      }
+    }
+    logInstall('MISSING', { action: 'auto-install' });
+    const pipBinary = await installYtDlpViaPip();
+    if (pipBinary) { ytDlpResolved = pipBinary; logInstall('INSTALLED', { method: 'pip', binary: pipBinary }); return pipBinary; }
+    const downloadedBinary = await installYtDlpBinary();
+    if (downloadedBinary) { ytDlpResolved = downloadedBinary; logInstall('INSTALLED', { method: 'release', binary: downloadedBinary }); return downloadedBinary; }
+    throw new Error('yt-dlp tidak ditemukan dan auto-install gagal. Install yt-dlp atau set YTDLP_PATH.');
+  })();
+  try { return await ytDlpInstallPromise; } finally { ytDlpInstallPromise = null; }
+}
+
 const TIKTOK_BASE = 'https://www.tiktok.com';
 const COOKIES_FILE = path.join(process.cwd(), 'cookies', 'cookiestt.txt');
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 async function runYtDlp(args, timeout = 120000) {
+  const binary = await ensureYtDlp();
   try {
-    return await execFileAsync('yt-dlp', args, { timeout, maxBuffer: 16 * 1024 * 1024 });
+    const result = await execFileAsync(binary, args, { timeout, maxBuffer: 16 * 1024 * 1024 });
+    logInstall('COMMAND_OK', { binary, args: args.filter(arg => !String(arg).includes('cookies')).slice(0, 8) });
+    return result;
   } catch (err) {
-    if (err.code === 'ENOENT') throw new Error('yt-dlp tidak ditemukan di server. Install yt-dlp terlebih dahulu.');
+    logInstall('COMMAND_ERROR', { binary, message: String(err.message || '').split('\\n').slice(0, 2).join(' | ') });
     throw err;
   }
 }
@@ -470,4 +546,4 @@ function collectVideosFromHtml(html, username) {
   return out;
 }
 
-module.exports = { scrapeTikTokProfile, readTikTokCookieHeader, normalizeUsername, normalizeTikTokResult, fetchVideosWithYtDlp, downloadTikTokVideo };
+module.exports = { scrapeTikTokProfile, readTikTokCookieHeader, normalizeUsername, normalizeTikTokResult, fetchVideosWithYtDlp, downloadTikTokVideo, ensureYtDlp };
