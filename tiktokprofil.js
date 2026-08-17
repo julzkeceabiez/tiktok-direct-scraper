@@ -9,6 +9,15 @@ const TIKTOK_BASE = 'https://www.tiktok.com';
 const COOKIES_FILE = path.join(process.cwd(), 'cookies', 'cookiestt.txt');
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
+function ttLog(stage, payload = {}) {
+  const safe = { ...payload };
+  delete safe.cookie;
+  delete safe.cookieHeader;
+  delete safe.cookies;
+  try { console.log(`[TTSTALK][${stage}] ${JSON.stringify(safe)}`); }
+  catch { console.log(`[TTSTALK][${stage}]`, stage); }
+}
+
 function readTikTokCookieHeader(filePath = COOKIES_FILE) {
   if (!fs.existsSync(filePath)) return '';
   const values = [];
@@ -126,9 +135,11 @@ async function scrapeTikTokProfile(input, options = {}) {
   const username = normalizeUsername(input);
   const profileUrl = `${TIKTOK_BASE}/@${encodeURIComponent(username)}`;
   const cookieHeader = readTikTokCookieHeader(options.cookiesFile || COOKIES_FILE);
+  ttLog('START', { username, profileUrl, cookies: Boolean(cookieHeader), cookieCount: cookieHeader ? cookieHeader.split('; ').length : 0 });
 
   // ─── 1. Coba endpoint API ───
   const apiResult = await fetchUserInfoFromApi(username, cookieHeader);
+  ttLog('API_RESULT', { ok: Boolean(apiResult), source: apiResult?.source || null });
   if (apiResult) {
     const { info } = apiResult;
     const user = info.user;
@@ -152,13 +163,19 @@ async function scrapeTikTokProfile(input, options = {}) {
     if (!videos.length) {
       // Fallback: tidak ada video, kembalikan kosong
     }
-      return normalizeTikTokResult(profile, videos, 'api');
+      const result = normalizeTikTokResult(profile, videos, 'api');
+    ttLog('SUCCESS', { username: result.username, avatar: Boolean(result.avatar), videoCount: result.videoCount, returnedVideos: result.videos.length, videos: result.videos });
+    return result;
   }
 
   // ─── 2. Coba halaman HTML ───
   // TikTok kadang mengirim shell React 12 KB tanpa JSON profil pada URL polos.
   // Parameter lang=en mengembalikan hydration JSON yang dibutuhkan scraper.
-  const profileFetchUrl = `${profileUrl}?lang=en`;
+  const profileFetchUrls = [
+    `${profileUrl}?lang=en`,
+    `${profileUrl}?lang=en&is_from_webapp=v1`,
+    `${profileUrl}?lang=en&is_copy_url=1&is_from_webapp=v1&sender_device=pc`
+  ];
   let response;
   let html = '';
   let status = 0;
@@ -166,7 +183,8 @@ async function scrapeTikTokProfile(input, options = {}) {
   let info = null;
   try {
     for (let attempt = 1; attempt <= 3; attempt += 1) {
-      response = await axios.get(profileFetchUrl, {
+      const requestUrl = profileFetchUrls[attempt - 1];
+      response = await axios.get(requestUrl, {
         headers: {
           'User-Agent': USER_AGENT,
           'Accept-Language': 'en-US,en;q=0.9',
@@ -184,10 +202,15 @@ async function scrapeTikTokProfile(input, options = {}) {
       if (status < 200 || status >= 300) throw new Error(`TikTok HTTP ${status}`);
       scripts = extractDataScripts(html);
       for (const script of scripts) {
+
         info = findUserInfo(script.data);
         if (info?.user) break;
       }
-      if (info?.user) break;
+      ttLog('HTML_ATTEMPT', { attempt, requestUrl, status, bytes: Buffer.byteLength(html), scriptIds: scripts.map(s => s.id), profileFound: Boolean(info?.user) });
+      if (info?.user) {
+        ttLog('PROFILE_FOUND', { attempt, requestUrl, source: 'html', username: info.user.uniqueId || username });
+        break;
+      }
       if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 350 * attempt));
     }
   } catch (err) {
@@ -235,7 +258,9 @@ async function scrapeTikTokProfile(input, options = {}) {
     videos = collectVideosFromHtml(html, profile.username);
   }
 
-  return normalizeTikTokResult(profile, videos, 'html');
+  const result = normalizeTikTokResult(profile, videos, 'html');
+  ttLog('SUCCESS', { username: result.username, avatar: Boolean(result.avatar), videoCount: result.videoCount, returnedVideos: result.videos.length, videos: result.videos });
+  return result;
 }
 
 function normalizeTikTokResult(profile, videos, source = 'tiktok') {
