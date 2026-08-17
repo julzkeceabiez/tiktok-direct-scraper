@@ -29,3 +29,16 @@ Handler mengirim satu kartu data profil dan maksimal lima kartu video melalui `A
 TikTok dapat menampilkan CAPTCHA atau mengosongkan endpoint daftar video untuk request server-side. Jika itu terjadi, data profil mungkin masih terbaca tetapi daftar video tidak tersedia. Cookies tidak menjamin CAPTCHA dapat dilewati karena TikTok mengikat sebagian validasi pada konteks browser dan request signature. Jangan memasukkan cookies ke repository, log, atau pesan error.
 
 Repository ini sengaja tidak menyertakan cookies, token, atau file sesi apa pun.
+
+## yt-dlp untuk URL video dan download
+
+Untuk enumerasi maksimal lima URL video profil dan mengunduh video berdasarkan URL tersebut, install `yt-dlp` dan `ffmpeg` pada server:
+
+```bash
+sudo pip3 install -U yt-dlp
+sudo apt-get install -y ffmpeg
+```
+
+Scraper akan mencoba membaca video dari response TikTok terlebih dahulu. Jika `itemList` kosong, scraper menggunakan `yt-dlp --flat-playlist --playlist-end 5` pada URL profil, sehingga response tetap berupa URL halaman video, bukan file video. Handler `ttstalk` pada `ttstalk-handler-stable.js` kemudian mengirim kartu profil, mengunduh setiap URL dengan `yt-dlp`, dan mengirim maksimal lima file video secara berurutan.
+
+Log per video menggunakan tahap `YTDLP_RESULT`, `DOWNLOAD_START`, `DOWNLOAD_OK`, `VIDEO_SEND_OK`, atau `DOWNLOAD_ERROR`. Cookie tidak pernah dicetak ke log.

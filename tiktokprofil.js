@@ -4,10 +4,65 @@ const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const os = require('os');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const execFileAsync = promisify(execFile);
 
 const TIKTOK_BASE = 'https://www.tiktok.com';
 const COOKIES_FILE = path.join(process.cwd(), 'cookies', 'cookiestt.txt');
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+async function runYtDlp(args, timeout = 120000) {
+  try {
+    return await execFileAsync('yt-dlp', args, { timeout, maxBuffer: 16 * 1024 * 1024 });
+  } catch (err) {
+    if (err.code === 'ENOENT') throw new Error('yt-dlp tidak ditemukan di server. Install yt-dlp terlebih dahulu.');
+    throw err;
+  }
+}
+
+async function fetchVideosWithYtDlp(profileUrl, cookiesFile, limit = 5) {
+  const args = ['--flat-playlist', '--playlist-end', String(limit), '--dump-single-json', '--skip-download', '--no-warnings', '--ignore-errors'];
+  if (cookiesFile && fs.existsSync(cookiesFile)) args.push('--cookies', cookiesFile);
+  args.push(profileUrl);
+  const { stdout } = await runYtDlp(args);
+  const data = JSON.parse(String(stdout || '{}'));
+  const entries = Array.isArray(data.entries) ? data.entries : [];
+  return entries.filter(Boolean).slice(0, limit).map(entry => {
+    const id = String(entry.id || '').trim() || null;
+    const url = entry.webpage_url || entry.original_url || (id ? `https://www.tiktok.com/@${entry.uploader_id || entry.uploader || ''}/video/${id}` : null);
+    const thumbs = Array.isArray(entry.thumbnails) ? entry.thumbnails : [];
+    return { id, title: String(entry.title || '').trim(), url, thumbnail: entry.thumbnail || thumbs.at(-1)?.url || null, views: entry.view_count ?? null };
+  }).filter(video => video.url && /\/video\/\d+/.test(video.url));
+}
+
+async function resolveVideos(profileUrl, cookiesFile, initialVideos = []) {
+  const seed = Array.isArray(initialVideos) ? initialVideos.slice(0, 5) : [];
+  if (seed.length >= 5) return seed;
+  try {
+    const videos = await fetchVideosWithYtDlp(profileUrl, cookiesFile, 5);
+    ttLog('YTDLP_RESULT', { ok: true, returnedVideos: videos.length, videos });
+    return videos.length ? videos : seed;
+  } catch (err) {
+    ttLog('YTDLP_ERROR', { ok: false, message: err.message });
+    return seed;
+  }
+}
+
+async function downloadTikTokVideo(videoUrl, outputDir = path.join(os.tmpdir(), 'ttstalk'), cookiesFile) {
+  if (!/^https:\/\/www\.tiktok\.com\/@[^/]+\/video\/\d+/.test(videoUrl)) throw new Error('URL TikTok tidak valid');
+  fs.mkdirSync(outputDir, { recursive: true });
+  const output = path.join(outputDir, '%(id)s.%(ext)s');
+  const args = ['--no-playlist', '--format', 'mp4/best[ext=mp4]/best', '--merge-output-format', 'mp4', '--output', output, '--no-warnings'];
+  if (cookiesFile && fs.existsSync(cookiesFile)) args.push('--cookies', cookiesFile);
+  args.push(videoUrl);
+  await runYtDlp(args, 180000);
+  const id = (videoUrl.match(/\/video\/(\d+)/) || [])[1];
+  const found = fs.readdirSync(outputDir).filter(name => name.startsWith(`${id}.`)).sort();
+  if (!found.length) throw new Error(`yt-dlp selesai tetapi file video ${id} tidak ditemukan`);
+  return path.join(outputDir, found[0]);
+}
 
 function ttLog(stage, payload = {}) {
   const safe = { ...payload };
@@ -157,13 +212,9 @@ async function scrapeTikTokProfile(input, options = {}) {
       createdAt: user.createTime ? new Date(Number(user.createTime) * 1000).toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' }) : '-',
       url: profileUrl
     };
-    let videos = [];
-    // Coba ambil itemList dari info jika ada
-    videos = collectVideosFromData(info.itemList || info);
-    if (!videos.length) {
-      // Fallback: tidak ada video, kembalikan kosong
-    }
-      const result = normalizeTikTokResult(profile, videos, 'api');
+    let videos = collectVideosFromData(info.itemList || info);
+    videos = await resolveVideos(profileUrl, options.cookiesFile || COOKIES_FILE, videos);
+    const result = normalizeTikTokResult(profile, videos, 'api');
     ttLog('SUCCESS', { username: result.username, avatar: Boolean(result.avatar), videoCount: result.videoCount, returnedVideos: result.videos.length, videos: result.videos });
     return result;
   }
@@ -254,9 +305,8 @@ async function scrapeTikTokProfile(input, options = {}) {
   };
 
   let videos = collectVideosFromData(info.itemList || info);
-  if (!videos.length) {
-    videos = collectVideosFromHtml(html, profile.username);
-  }
+  if (!videos.length) videos = collectVideosFromHtml(html, profile.username);
+  videos = await resolveVideos(profileUrl, options.cookiesFile || COOKIES_FILE, videos);
 
   const result = normalizeTikTokResult(profile, videos, 'html');
   ttLog('SUCCESS', { username: result.username, avatar: Boolean(result.avatar), videoCount: result.videoCount, returnedVideos: result.videos.length, videos: result.videos });
@@ -322,6 +372,25 @@ function collectVideosFromHtml(html, username) {
   const $ = cheerio.load(html);
   const out = [];
   const seen = new Set();
+  const normalizedHtml = String(html || '').replace(/\\u002F/g, '/').replace(/\\\//g, '/').replace(/&amp;/g, '&');
+  const directUrlPattern = /https?:\/\/www\.tiktok\.com\/@([A-Za-z0-9._-]+)\/video\/(\d+)/g;
+  const relativeUrlPattern = /\/@([A-Za-z0-9._-]+)\/video\/(\d+)/g;
+  for (const match of normalizedHtml.matchAll(directUrlPattern)) {
+    if (out.length >= 5) break;
+    const url = `https://www.tiktok.com/@${match[1]}/video/${match[2]}`;
+    if (!seen.has(url)) {
+      out.push({ id: match[2], url, title: '', thumbnail: null, views: null });
+      seen.add(url);
+    }
+  }
+  for (const match of normalizedHtml.matchAll(relativeUrlPattern)) {
+    if (out.length >= 5) break;
+    const url = `https://www.tiktok.com/@${match[1]}/video/${match[2]}`;
+    if (!seen.has(url)) {
+      out.push({ id: match[2], url, title: '', thumbnail: null, views: null });
+      seen.add(url);
+    }
+  }
   $(`a[href*="/video/"]`).each((_, el) => {
     if (out.length >= 5) return false;
     const url = cleanUrl($(el).attr('href'));
@@ -335,4 +404,4 @@ function collectVideosFromHtml(html, username) {
   return out;
 }
 
-module.exports = { scrapeTikTokProfile, readTikTokCookieHeader, normalizeUsername, normalizeTikTokResult };
+module.exports = { scrapeTikTokProfile, readTikTokCookieHeader, normalizeUsername, normalizeTikTokResult, fetchVideosWithYtDlp, downloadTikTokVideo };
