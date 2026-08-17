@@ -222,6 +222,74 @@ async function fetchUserInfoFromApi(username, cookieHeader) {
   return null;
 }
 
+const TIKTOK_USER_AGENTS = [
+  USER_AGENT,
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36'
+];
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+async function fetchProfileHtml(profileUrl, username, cookieHeader, options = {}) {
+  const baseVariants = [
+    `${profileUrl}?lang=en`,
+    `${profileUrl}?lang=en&is_from_webapp=v1`,
+    `${profileUrl}?lang=en&is_copy_url=1&is_from_webapp=v1&sender_device=pc`,
+    `${profileUrl}?lang=en&enter_method=live_cover&enter_from=webapp`
+  ];
+  const attempts = [];
+  let lastHtml = '';
+  let lastStatus = 0;
+  let lastScripts = [];
+  let lastInfo = null;
+  const maxAttempts = Math.max(4, Number(options.htmlAttempts) || 8);
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const baseUrl = baseVariants[(attempt - 1) % baseVariants.length];
+    const requestUrl = `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}_ttstalk=${Date.now()}_${attempt}`;
+    const userAgent = TIKTOK_USER_AGENTS[(attempt - 1) % TIKTOK_USER_AGENTS.length];
+    try {
+      const response = await axios.get(requestUrl, {
+        headers: {
+          'User-Agent': userAgent,
+          'Accept-Language': attempt % 2 ? 'en-US,en;q=0.9' : 'id-ID,id;q=0.9,en-US;q=0.8',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+          'Referer': profileUrl,
+          'Cache-Control': 'no-cache, no-store',
+          'Pragma': 'no-cache',
+          ...(cookieHeader ? { Cookie: cookieHeader } : {})
+        },
+        timeout: options.timeout || 45000,
+        maxRedirects: 5,
+        validateStatus: () => true
+      });
+      const html = String(response.data || '');
+      const scripts = extractDataScripts(html);
+      let info = null;
+      for (const script of scripts) {
+        info = findUserInfo(script.data);
+        if (info?.user) break;
+      }
+      const record = { attempt, requestUrl, status: response.status, bytes: Buffer.byteLength(html), scriptIds: scripts.map(s => s.id), profileFound: Boolean(info?.user), userAgent: userAgent.includes('Android') ? 'android' : userAgent.includes('Chrome/140') ? 'chrome140' : 'chrome124' };
+      attempts.push(record);
+      ttLog('HTML_ATTEMPT', record);
+      lastHtml = html;
+      lastStatus = response.status;
+      lastScripts = scripts;
+      lastInfo = info;
+      if (response.status >= 200 && response.status < 300 && info?.user) {
+        ttLog('PROFILE_FOUND', { attempt, requestUrl, source: 'html', username: info.user.uniqueId || username });
+        return { response, html, status: response.status, scripts, info, attempts };
+      }
+    } catch (err) {
+      const record = { attempt, requestUrl, status: 0, profileFound: false, error: err.message };
+      attempts.push(record);
+      ttLog('HTML_ATTEMPT_ERROR', record);
+    }
+    if (attempt < maxAttempts) await sleep(Math.min(1000 + (attempt * 450), 5000));
+  }
+  return { response: null, html: lastHtml, status: lastStatus, scripts: lastScripts, info: lastInfo, attempts };
+}
+
 async function scrapeTikTokProfile(input, options = {}) {
   const username = normalizeUsername(input);
   const profileUrl = `${TIKTOK_BASE}/@${encodeURIComponent(username)}`;
@@ -255,54 +323,14 @@ async function scrapeTikTokProfile(input, options = {}) {
     return result;
   }
 
-  // ─── 2. Coba halaman HTML ───
-  // TikTok kadang mengirim shell React 12 KB tanpa JSON profil pada URL polos.
-  // Parameter lang=en mengembalikan hydration JSON yang dibutuhkan scraper.
-  const profileFetchUrls = [
-    `${profileUrl}?lang=en`,
-    `${profileUrl}?lang=en&is_from_webapp=v1`,
-    `${profileUrl}?lang=en&is_copy_url=1&is_from_webapp=v1&sender_device=pc`
-  ];
-  let response;
-  let html = '';
-  let status = 0;
-  let scripts = [];
-  let info = null;
-  try {
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      const requestUrl = profileFetchUrls[attempt - 1];
-      response = await axios.get(requestUrl, {
-        headers: {
-          'User-Agent': USER_AGENT,
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-          'Referer': profileUrl,
-          'Cache-Control': 'no-cache',
-          ...(cookieHeader ? { Cookie: cookieHeader } : {})
-        },
-        timeout: options.timeout || 45000,
-        maxRedirects: 5,
-        validateStatus: () => true
-      });
-      html = String(response.data || '');
-      status = response.status;
-      if (status < 200 || status >= 300) throw new Error(`TikTok HTTP ${status}`);
-      scripts = extractDataScripts(html);
-      for (const script of scripts) {
-
-        info = findUserInfo(script.data);
-        if (info?.user) break;
-      }
-      ttLog('HTML_ATTEMPT', { attempt, requestUrl, status, bytes: Buffer.byteLength(html), scriptIds: scripts.map(s => s.id), profileFound: Boolean(info?.user) });
-      if (info?.user) {
-        ttLog('PROFILE_FOUND', { attempt, requestUrl, source: 'html', username: info.user.uniqueId || username });
-        break;
-      }
-      if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 350 * attempt));
-    }
-  } catch (err) {
-    throw new Error(`Gagal menghubungi TikTok: ${err.message}`);
-  }
+  // TikTok kadang mengirim React shell kosong dengan status 200. Gunakan cache-busting,
+  // beberapa query variant, rotating browser headers, dan backoff sebelum gagal.
+  const htmlResult = await fetchProfileHtml(profileUrl, username, cookieHeader, options);
+  const response = htmlResult.response;
+  const html = htmlResult.html;
+  const status = htmlResult.status;
+  const scripts = htmlResult.scripts;
+  const info = htmlResult.info;
 
   // Deteksi CAPTCHA hanya setelah semua percobaan parsing selesai.
   if (!info?.user && /captcha-verify|drag the slider|verify to continue|challenge-platform/i.test(html)) {
@@ -320,6 +348,8 @@ async function scrapeTikTokProfile(input, options = {}) {
       `Title: ${title}\n` +
       `Script IDs: ${scriptIds}\n` +
       `Cookies: ${cookieHeader ? 'ada' : 'tidak ada'}\n` +
+      `Attempts: ${htmlResult.attempts.length}\n` +
+      `Successful attempts: ${htmlResult.attempts.filter(item => item.profileFound).length}\n` +
       `Snippet: ${snippet}`
     );
   }
