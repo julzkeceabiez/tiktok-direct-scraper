@@ -291,7 +291,7 @@ async function fetchUserInfoFromApi(username, cookieHeader) {
       if (res.status >= 200 && res.status < 300) {
         const data = res.data;
         const info = findUserInfo(data);
-        if (info?.user) return { info, source: url };
+        if (info?.user) return { info, data, source: url };
       }
     } catch (e) {}
   }
@@ -376,7 +376,7 @@ async function scrapeTikTokProfile(input, options = {}) {
   const apiResult = await fetchUserInfoFromApi(username, cookieHeader);
   ttLog('API_RESULT', { ok: Boolean(apiResult), source: apiResult?.source || null });
   if (apiResult) {
-    const { info } = apiResult;
+    const { info, data: apiData } = apiResult;
     const user = info.user;
     const stats = info.stats || info.statsV2 || {};
     const profile = {
@@ -392,7 +392,7 @@ async function scrapeTikTokProfile(input, options = {}) {
       createdAt: user.createTime ? new Date(Number(user.createTime) * 1000).toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' }) : '-',
       url: profileUrl
     };
-    let videos = collectVideosFromData(info.itemList || info);
+    let videos = collectVideosFromData(apiData || info, [], new Set(), username);
     videos = await resolveVideos(profileUrl, options.cookiesFile || COOKIES_FILE, videos);
     const result = normalizeTikTokResult(profile, videos, 'api');
     ttLog('SUCCESS', { username: result.username, avatar: Boolean(result.avatar), videoCount: result.videoCount, returnedVideos: result.videos.length, videos: result.videos });
@@ -446,7 +446,9 @@ async function scrapeTikTokProfile(input, options = {}) {
     url: profileUrl
   };
 
-  let videos = collectVideosFromData(info.itemList || info);
+  // itemList sering berada di root hydration, bukan di userInfo.
+  // Scan semua script JSON agar video tidak hilang hanya karena nesting TikTok berubah.
+  let videos = collectVideosFromData(scripts.map(script => script.data), [], new Set(), profile.username);
   if (!videos.length) videos = collectVideosFromHtml(html, profile.username);
   videos = await resolveVideos(profileUrl, options.cookiesFile || COOKIES_FILE, videos);
 
@@ -487,14 +489,16 @@ function normalizeTikTokResult(profile, videos, source = 'tiktok') {
   };
 }
 
-function collectVideosFromData(value, out = [], seen = new Set()) {
+function collectVideosFromData(value, out = [], seen = new Set(), fallbackUsername = '') {
   if (!value || typeof value !== 'object' || out.length >= 5) return out;
   if (Array.isArray(value)) {
-    for (const item of value) collectVideosFromData(item, out, seen);
+    for (const item of value) collectVideosFromData(item, out, seen, fallbackUsername);
     return out;
   }
   const id = String(value.id || value.awemeId || value.itemId || '');
-  const videoUrl = id && /^\d{8,}$/.test(id) ? `https://www.tiktok.com/@${value.author?.uniqueId || value.author?.unique_id || ''}/video/${id}` : null;
+  const authorCandidate = String(value.author?.uniqueId || value.author?.unique_id || value.author?.nickname || '').trim();
+  const author = authorCandidate && /^[A-Za-z0-9._-]{2,50}$/.test(authorCandidate) && !/^\d{8,}$/.test(authorCandidate) ? authorCandidate : fallbackUsername;
+  const videoUrl = id && author && /^\d{8,}$/.test(id) ? `https://www.tiktok.com/@${author}/video/${id}` : null;
   if (videoUrl && !seen.has(videoUrl)) {
     const thumbnail = value.video?.cover || value.video?.originCover || value.video?.dynamicCover || null;
     out.push({
@@ -506,7 +510,7 @@ function collectVideosFromData(value, out = [], seen = new Set()) {
     });
     seen.add(videoUrl);
   }
-  for (const item of Object.values(value)) collectVideosFromData(item, out, seen);
+  for (const item of Object.values(value)) collectVideosFromData(item, out, seen, fallbackUsername);
   return out;
 }
 
