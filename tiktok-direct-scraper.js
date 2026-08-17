@@ -51,7 +51,9 @@ function cleanUrl(value) {
   if (!value) return null;
   try {
     const url = new URL(String(value), TIKTOK_BASE);
-    return url.protocol === 'https:' && url.hostname.endsWith('tiktok.com') ? url.href : null;
+    const host = url.hostname.toLowerCase();
+    const allowed = host.endsWith('tiktok.com') || host.endsWith('tiktokcdn.com') || host.endsWith('ibytedtos.com') || host.endsWith('ibyteimg.com') || host.endsWith('muscdn.com');
+    return url.protocol === 'https:' && allowed ? url.href : null;
   } catch { return null; }
 }
 
@@ -100,16 +102,32 @@ function formatNumber(value) {
 async function scrapeTikTokProfile(input, options = {}) {
   const username = normalizeUsername(input);
   const profileUrl = `${TIKTOK_BASE}/@${encodeURIComponent(username)}`;
+  // TikTok sometimes returns a 12 KB React shell without profile JSON unless lang=en is present.
+  const profileFetchUrl = `${profileUrl}?lang=en`;
   const cookie = readTikTokCookieHeader(options.cookiesFile || COOKIES_FILE);
-  const response = await axios.get(profileUrl, {
-    headers: { 'User-Agent': USER_AGENT, 'Accept-Language': 'en-US,en;q=0.9', Accept: 'text/html,application/xhtml+xml', ...(cookie ? { Cookie: cookie } : {}) },
-    timeout: options.timeout || 45000,
-    maxRedirects: 5,
-    validateStatus: () => true
-  });
-  const html = String(response.data || '');
-  if (response.status < 200 || response.status >= 300) throw new Error(`TikTok HTTP ${response.status}`);
-  const hydration = extractHydration(html);
+  let response;
+  let html = '';
+  let hydration = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    response = await axios.get(profileFetchUrl, {
+      headers: {
+        'User-Agent': USER_AGENT,
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Referer': profileUrl,
+        'Cache-Control': 'no-cache',
+        ...(cookie ? { Cookie: cookie } : {})
+      },
+      timeout: options.timeout || 45000,
+      maxRedirects: 5,
+      validateStatus: () => true
+    });
+    html = String(response.data || '');
+    if (response.status < 200 || response.status >= 300) throw new Error(`TikTok HTTP ${response.status}`);
+    hydration = extractHydration(html);
+    if (hydration) break;
+    if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 350 * attempt));
+  }
   const info = findUserInfo(hydration);
   if (!info?.user) {
     if (/captcha-verify|drag the slider|verify to continue/i.test(html)) throw new Error('TikTok meminta CAPTCHA; cookies/sesi browser perlu diperbarui');
@@ -135,4 +153,4 @@ async function scrapeTikTokProfile(input, options = {}) {
   return { profile, videos: videos.slice(0, 5), rawHtmlBytes: Buffer.byteLength(html) };
 }
 
-module.exports = { scrapeTikTokProfile, readTikTokCookieHeader, normalizeUsername };
+module.exports = { scrapeTikTokProfile, readTikTokCookieHeader, normalizeUsername, extractHydration, findUserInfo };
