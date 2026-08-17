@@ -152,7 +152,7 @@ async function scrapeTikTokProfile(input, options = {}) {
     if (!videos.length) {
       // Fallback: tidak ada video, kembalikan kosong
     }
-    return { profile, videos: videos.slice(0, 5), rawSource: 'api' };
+      return normalizeTikTokResult(profile, videos, 'api');
   }
 
   // ─── 2. Coba halaman HTML ───
@@ -235,7 +235,39 @@ async function scrapeTikTokProfile(input, options = {}) {
     videos = collectVideosFromHtml(html, profile.username);
   }
 
-  return { profile, videos: videos.slice(0, 5), rawSource: 'html' };
+  return normalizeTikTokResult(profile, videos, 'html');
+}
+
+function normalizeTikTokResult(profile, videos, source = 'tiktok') {
+  const normalizedVideos = videos.slice(0, 5).map(video => {
+    const id = video.id || (String(video.url || '').match(/\/video\/(\d+)/) || [])[1] || null;
+    return {
+      id,
+      title: video.title || '',
+      url: video.url,
+      thumbnail: video.thumbnail || null,
+      views: video.views == null ? null : Number(video.views)
+    };
+  });
+  return {
+    success: true,
+    type: 'tiktok_profile',
+    username: profile.username,
+    nickname: profile.nickname,
+    bio: profile.bio,
+    avatar: profile.avatar,
+    followers: Number(profile.followers || 0),
+    following: Number(profile.following || 0),
+    likes: Number(profile.likes || 0),
+    videoCount: Number(profile.videos || 0),
+    verified: Boolean(profile.verified),
+    createdAt: profile.createdAt || '-',
+    profileUrl: profile.url,
+    videos: normalizedVideos,
+    totalVideos: normalizedVideos.length,
+    source,
+    raw: null
+  };
 }
 
 function collectVideosFromData(value, out = [], seen = new Set()) {
@@ -249,6 +281,7 @@ function collectVideosFromData(value, out = [], seen = new Set()) {
   if (videoUrl && !seen.has(videoUrl)) {
     const thumbnail = value.video?.cover || value.video?.originCover || value.video?.dynamicCover || null;
     out.push({
+      id,
       url: videoUrl,
       title: String(value.desc || value.title || '').trim(),
       thumbnail: cleanUrl(thumbnail),
@@ -270,10 +303,11 @@ function collectVideosFromHtml(html, username) {
     if (!url || !/\/video\/\d+/.test(url) || seen.has(url)) return;
     const img = $(el).find('img').first();
     const title = ($(el).text() || $(el).attr('aria-label') || '').replace(/\s+/g, ' ').trim();
-    out.push({ url, title, thumbnail: cleanUrl(img.attr('src')), views: null });
+    const id = (url.match(/\/video\/(\d+)/) || [])[1] || null;
+    out.push({ id, url, title, thumbnail: cleanUrl(img.attr('src')), views: null });
     seen.add(url);
   });
   return out;
 }
 
-module.exports = { scrapeTikTokProfile, readTikTokCookieHeader, normalizeUsername };
+module.exports = { scrapeTikTokProfile, readTikTokCookieHeader, normalizeUsername, normalizeTikTokResult };
